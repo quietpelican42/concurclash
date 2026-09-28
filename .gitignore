@@ -1,0 +1,4 @@
+/concurclash
+/bin/
+*.out
+coverage.txt
