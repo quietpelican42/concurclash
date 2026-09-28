@@ -29,10 +29,27 @@ func TestRunExitCodeCleanRepo(t *testing.T) {
 	}
 }
 
-func TestRunExitCodeWithFindings(t *testing.T) {
+// A literal group shared across workflows is downgraded to a warning (it's
+// a common, deliberate pattern), but the CLI still exits 1: any finding,
+// any severity, is a non-clean exit.
+func TestRunExitCodeWithWarningOnlyFindings(t *testing.T) {
 	dir := t.TempDir()
 	writeWorkflow(t, dir, "a.yml", "name: A\non: push\nconcurrency:\n  group: shared\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n")
 	writeWorkflow(t, dir, "b.yml", "name: B\non: push\nconcurrency:\n  group: shared\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps: []\n")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{dir}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout=%s", code, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "WARNING") {
+		t.Errorf("expected a warning-level finding in stdout, got %q", stdout.String())
+	}
+}
+
+func TestRunExitCodeWithErrorFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeWorkflow(t, dir, "a.yml", "name: CI\non: push\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.ref }}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n")
+	writeWorkflow(t, dir, "b.yml", "name: CI\non: push\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.ref }}\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps: []\n")
 	var stdout, stderr bytes.Buffer
 	code := run([]string{dir}, &stdout, &stderr)
 	if code != 1 {

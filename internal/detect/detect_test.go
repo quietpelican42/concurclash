@@ -67,14 +67,20 @@ jobs:
 	}
 }
 
-// --- Definite collision: identical literal groups, no ref dependency ---
+// --- Definite collision via an expression (accidental, stays an error) ---
+//
+// github.repository is always the same value within one repository, so two
+// workflows both keying their group off it (plus identical literal text)
+// produce a provable collision. Unlike a plain string literal, the author
+// wrote an expression here, so this is treated as the "computed, probably
+// accidental" bucket, not the "plain string, probably deliberate" bucket.
 
-func TestDefiniteCollisionLiteralGroups(t *testing.T) {
+func TestDefiniteCollisionViaExpression(t *testing.T) {
 	a := mustParse(t, ".github/workflows/one.yml", `
 name: One
 on: push
 concurrency:
-  group: prod-deploy
+  group: ${{ github.repository }}-prod-lock
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -84,7 +90,7 @@ jobs:
 name: Two
 on: push
 concurrency:
-  group: prod-deploy
+  group: ${{ github.repository }}-prod-lock
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -98,6 +104,120 @@ jobs:
 		if f.Kind == KindDefiniteCollision && f.Severity != SeverityError {
 			t.Errorf("definite collision should be error severity, got %s", f.Severity)
 		}
+	}
+}
+
+// --- A plain string literal shared across workflows is downgraded to a
+// warning: this is a common, deliberate pattern (a shared lock name to
+// serialize deploys), not a duplicate-name accident. See
+// KindLiteralSharedGroup.
+
+func TestLiteralSharedGroupDowngradedToWarning(t *testing.T) {
+	a := mustParse(t, ".github/workflows/deploy-api.yml", `
+name: Deploy API
+on: push
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps: []
+`)
+	b := mustParse(t, ".github/workflows/deploy-web.yml", `
+name: Deploy Web
+on: push
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps: []
+`)
+	findings := Analyze([]*workflow.Workflow{a, b})
+	if !hasKind(findings, KindLiteralSharedGroup) {
+		t.Fatalf("expected a literal-shared-group finding, got %+v", findings)
+	}
+	if hasKind(findings, KindDefiniteCollision) {
+		t.Fatalf("a plain literal group must not be reported as definite-collision, got %+v", findings)
+	}
+	for _, f := range findings {
+		if f.Kind == KindLiteralSharedGroup {
+			if f.Severity != SeverityWarning {
+				t.Errorf("literal-shared-group should be warning severity, got %s", f.Severity)
+			}
+			if !strings.Contains(f.Message, "pending") {
+				t.Errorf("message should cite GitHub's documented pending-run hazard, got %q", f.Message)
+			}
+			if !strings.Contains(f.Message, "concurclash: shared") {
+				t.Errorf("message should explain how to suppress, got %q", f.Message)
+			}
+		}
+	}
+}
+
+// --- The same pair, but acknowledged on one side with a suppression
+// comment: no finding at all for this pair. ---
+
+func TestLiteralSharedGroupSuppressed(t *testing.T) {
+	a := mustParse(t, ".github/workflows/deploy-api.yml", `
+name: Deploy API
+on: push
+concurrency:
+  group: production-deploy  # concurclash: shared
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps: []
+`)
+	b := mustParse(t, ".github/workflows/deploy-web.yml", `
+name: Deploy Web
+on: push
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps: []
+`)
+	if !a.Concurrency.Suppressed {
+		t.Fatal("expected the parsed workflow to record the suppression comment")
+	}
+	findings := Analyze([]*workflow.Workflow{a, b})
+	if len(findings) != 0 {
+		t.Fatalf("expected the suppression comment to silence the pair entirely (including the cancel-in-progress mismatch), got %+v", findings)
+	}
+}
+
+// Negative control: the suppression marker text must be matched precisely,
+// not just "any comment on the group line".
+func TestUnrelatedCommentDoesNotSuppress(t *testing.T) {
+	a := mustParse(t, ".github/workflows/deploy-api.yml", `
+name: Deploy API
+on: push
+concurrency:
+  group: production-deploy  # TODO: revisit this
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps: []
+`)
+	b := mustParse(t, ".github/workflows/deploy-web.yml", `
+name: Deploy Web
+on: push
+concurrency:
+  group: production-deploy
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps: []
+`)
+	findings := Analyze([]*workflow.Workflow{a, b})
+	if !hasKind(findings, KindLiteralSharedGroup) {
+		t.Fatalf("an unrelated comment must not suppress the finding, got %+v", findings)
 	}
 }
 
@@ -348,7 +468,7 @@ jobs:
   do-it:
     runs-on: ubuntu-latest
     concurrency:
-      group: shared-lock
+      group: ${{ github.repository }}-shared-lock
     steps: []
 `)
 	caller := mustParse(t, ".github/workflows/caller.yml", `
@@ -362,7 +482,7 @@ jobs:
 name: Other
 on: push
 concurrency:
-  group: shared-lock
+  group: ${{ github.repository }}-shared-lock
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -419,7 +539,7 @@ func TestCollisionMessageNamesBothFiles(t *testing.T) {
 	findings := Analyze([]*workflow.Workflow{a, b})
 	var msg string
 	for _, f := range findings {
-		if f.Kind == KindDefiniteCollision {
+		if f.Kind == KindLiteralSharedGroup {
 			msg = f.Message
 		}
 	}

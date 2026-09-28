@@ -32,6 +32,12 @@ type Concurrency struct {
 	// CancelInProgress is nil because the value was "${{ ... }}".
 	CancelInProgressExpr string
 	Line                 int
+	// Suppressed is true when the "group" line carries a trailing
+	// "# concurclash: shared" comment, acknowledging that this group is
+	// deliberately shared with another workflow (e.g. to serialize deploys
+	// to one environment). See the README's "Suppressing an intentional
+	// collision" section.
+	Suppressed bool
 }
 
 // Job is one job entry from a workflow's "jobs:" map.
@@ -196,6 +202,7 @@ func parseConcurrency(node *yaml.Node) (*Concurrency, error) {
 			GroupParts:       expr.Parse(node.Value),
 			CancelInProgress: boolPtr(false),
 			Line:             node.Line,
+			Suppressed:       isSharedSuppression(node.LineComment),
 		}, nil
 	case yaml.MappingNode:
 		c := &Concurrency{CancelInProgress: boolPtr(false), Line: node.Line}
@@ -206,6 +213,7 @@ func parseConcurrency(node *yaml.Node) (*Concurrency, error) {
 			case "group":
 				c.GroupRaw = v.Value
 				c.GroupParts = expr.Parse(v.Value)
+				c.Suppressed = isSharedSuppression(v.LineComment)
 				if c.Line == 0 {
 					c.Line = k.Line
 				}
@@ -261,6 +269,20 @@ func parseJobs(node *yaml.Node) ([]*Job, error) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// isSharedSuppression reports whether a YAML trailing comment marks its
+// group as an acknowledged, intentionally shared concurrency group, e.g.:
+//
+//	concurrency:
+//	  group: production-deploy  # concurclash: shared
+//
+// Matching is deliberately loose (case-insensitive, tolerant of missing
+// space after the colon) since this is a human-written annotation.
+func isSharedSuppression(comment string) bool {
+	c := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(comment), "#")))
+	c = strings.TrimSpace(c)
+	return c == "concurclash: shared" || c == "concurclash:shared"
+}
 
 // FS-based variant kept for future use / testing against an fs.FS rooted
 // at the repository (not currently used by the CLI, which reads the real

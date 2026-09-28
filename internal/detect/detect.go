@@ -30,6 +30,14 @@ const (
 	KindDuplicateWorkflowName Kind = "duplicate-workflow-name"
 	KindSameGroupNesting      Kind = "job-workflow-same-group"
 	KindCancelMismatch        Kind = "cancel-in-progress-mismatch"
+	// KindLiteralSharedGroup is a definite collision where neither side's
+	// authored group contains any "${{ ... }}" expression at all — a group
+	// typed as a plain string and shared across workflows on purpose is a
+	// common, deliberate pattern (serializing deploys to one environment),
+	// so this is reported as a warning rather than an error, and can be
+	// acknowledged with a "# concurclash: shared" comment on the group
+	// line to suppress it entirely. See the README.
+	KindLiteralSharedGroup Kind = "literal-shared-group"
 )
 
 // Location pins a Finding to one workflow file, and optionally one job
@@ -55,16 +63,18 @@ type Finding struct {
 // the calling workflow's trigger, because a called reusable workflow's
 // jobs run inside the caller's own run and share its ref/event context.
 type unit struct {
-	wfPath   string // workflow file that OWNS the trigger context (the caller, for reused jobs)
-	jobID    string // "" for a workflow-level block
-	origin   string // e.g. "" or "via ./.github/workflows/reusable.yml"
-	events   map[string]bool
-	rawGroup string
-	parts    []expr.Part // github.workflow already substituted
-	usesGHWF bool        // true if the pre-substitution group referenced github.workflow
-	cip      *bool
-	cipExpr  string
-	line     int
+	wfPath     string // workflow file that OWNS the trigger context (the caller, for reused jobs)
+	jobID      string // "" for a workflow-level block
+	origin     string // e.g. "" or "via ./.github/workflows/reusable.yml"
+	events     map[string]bool
+	rawGroup   string
+	parts      []expr.Part // github.workflow already substituted
+	usesGHWF   bool        // true if the pre-substitution group referenced github.workflow
+	hasSymbol  bool        // true if the pre-substitution group contained ANY "${{ ... }}" expression
+	suppressed bool        // true if the group line carries "# concurclash: shared"
+	cip        *bool
+	cipExpr    string
+	line       int
 }
 
 type refClass int
@@ -212,6 +222,21 @@ func usesGithubWorkflow(parts []expr.Part) bool {
 	return false
 }
 
+// hasAnySymbol reports whether the group, as the author wrote it, contains
+// any "${{ ... }}" expression at all. A group with none is a plain string
+// literal — sharing one across workflows is a common deliberate pattern
+// (e.g. a single lock name to serialize deploys), as opposed to a group
+// that computes to the same value only because of an expression like
+// github.workflow. See KindLiteralSharedGroup.
+func hasAnySymbol(parts []expr.Part) bool {
+	for _, p := range parts {
+		if p.Kind == expr.Symbol {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveLocalUses turns a "uses:" value into a workflow-relative path if
 // it references a local reusable workflow ("./.github/workflows/x.yml" or
 // "./x.yml" relative to the workflows directory is NOT valid per GitHub —
@@ -289,29 +314,33 @@ func collectUnits(workflows []*workflow.Workflow, byPath map[string]*workflow.Wo
 		name := w.ResolvedName()
 		if w.Concurrency != nil {
 			units = append(units, unit{
-				wfPath:   w.Path,
-				jobID:    "",
-				events:   w.Events,
-				rawGroup: w.Concurrency.GroupRaw,
-				parts:    substituteGithubWorkflow(w.Concurrency.GroupParts, name),
-				usesGHWF: usesGithubWorkflow(w.Concurrency.GroupParts),
-				cip:      w.Concurrency.CancelInProgress,
-				cipExpr:  w.Concurrency.CancelInProgressExpr,
-				line:     w.Concurrency.Line,
+				wfPath:     w.Path,
+				jobID:      "",
+				events:     w.Events,
+				rawGroup:   w.Concurrency.GroupRaw,
+				parts:      substituteGithubWorkflow(w.Concurrency.GroupParts, name),
+				usesGHWF:   usesGithubWorkflow(w.Concurrency.GroupParts),
+				hasSymbol:  hasAnySymbol(w.Concurrency.GroupParts),
+				suppressed: w.Concurrency.Suppressed,
+				cip:        w.Concurrency.CancelInProgress,
+				cipExpr:    w.Concurrency.CancelInProgressExpr,
+				line:       w.Concurrency.Line,
 			})
 		}
 		for _, j := range w.Jobs {
 			if j.Concurrency != nil {
 				units = append(units, unit{
-					wfPath:   w.Path,
-					jobID:    j.ID,
-					events:   w.Events,
-					rawGroup: j.Concurrency.GroupRaw,
-					parts:    substituteGithubWorkflow(j.Concurrency.GroupParts, name),
-					usesGHWF: usesGithubWorkflow(j.Concurrency.GroupParts),
-					cip:      j.Concurrency.CancelInProgress,
-					cipExpr:  j.Concurrency.CancelInProgressExpr,
-					line:     j.Concurrency.Line,
+					wfPath:     w.Path,
+					jobID:      j.ID,
+					events:     w.Events,
+					rawGroup:   j.Concurrency.GroupRaw,
+					parts:      substituteGithubWorkflow(j.Concurrency.GroupParts, name),
+					usesGHWF:   usesGithubWorkflow(j.Concurrency.GroupParts),
+					hasSymbol:  hasAnySymbol(j.Concurrency.GroupParts),
+					suppressed: j.Concurrency.Suppressed,
+					cip:        j.Concurrency.CancelInProgress,
+					cipExpr:    j.Concurrency.CancelInProgressExpr,
+					line:       j.Concurrency.Line,
 				})
 			}
 			units = append(units, collectCalledUnits(w, j, byPath, map[string]bool{w.Path: true}, "")...)
@@ -339,16 +368,18 @@ func collectCalledUnits(caller *workflow.Workflow, job *workflow.Job, byPath map
 	for _, cj := range called.Jobs {
 		if cj.Concurrency != nil {
 			units = append(units, unit{
-				wfPath:   caller.Path,
-				jobID:    job.ID + "/" + cj.ID,
-				origin:   newChain + called.Path + ":" + cj.ID,
-				events:   caller.Events,
-				rawGroup: cj.Concurrency.GroupRaw,
-				parts:    substituteGithubWorkflow(cj.Concurrency.GroupParts, name),
-				usesGHWF: usesGithubWorkflow(cj.Concurrency.GroupParts),
-				cip:      cj.Concurrency.CancelInProgress,
-				cipExpr:  cj.Concurrency.CancelInProgressExpr,
-				line:     cj.Concurrency.Line,
+				wfPath:     caller.Path,
+				jobID:      job.ID + "/" + cj.ID,
+				origin:     newChain + called.Path + ":" + cj.ID,
+				events:     caller.Events,
+				rawGroup:   cj.Concurrency.GroupRaw,
+				parts:      substituteGithubWorkflow(cj.Concurrency.GroupParts, name),
+				usesGHWF:   usesGithubWorkflow(cj.Concurrency.GroupParts),
+				hasSymbol:  hasAnySymbol(cj.Concurrency.GroupParts),
+				suppressed: cj.Concurrency.Suppressed,
+				cip:        cj.Concurrency.CancelInProgress,
+				cipExpr:    cj.Concurrency.CancelInProgressExpr,
+				line:       cj.Concurrency.Line,
 			})
 		}
 		units = append(units, collectCalledUnits(caller, cj, byPath, visited, newChain)...)
@@ -471,26 +502,59 @@ func checkCrossRunCollisions(units []unit) []Finding {
 			if v == vNone {
 				continue
 			}
+
+			// A definite collision where NEITHER side's authored group
+			// contains any "${{ ... }}" expression at all is a plain string
+			// shared across workflows — often deliberate (a shared lock
+			// name to serialize deploys), not a duplicate-name accident.
+			// Downgrade it, and let it be acknowledged/suppressed.
+			literalShared := v == vDefinite && !a.hasSymbol && !b.hasSymbol
+			if literalShared && (a.suppressed || b.suppressed) {
+				// Acknowledged via "# concurclash: shared" on either side:
+				// no finding at all, including any cancel-in-progress note
+				// for this same pair.
+				continue
+			}
+
 			kind := KindPossibleCollision
 			sev := SeverityWarning
-			if v == vDefinite {
-				kind = KindDefiniteCollision
-				sev = SeverityError
-			}
-			locA := Location{Path: a.wfPath, JobID: a.jobID, Line: a.line, Group: a.rawGroup}
-			locB := Location{Path: b.wfPath, JobID: b.jobID, Line: b.line, Group: b.rawGroup}
 			verb := "can"
 			if v == vDefinite {
 				verb = "will"
+				kind = KindDefiniteCollision
+				sev = SeverityError
 			}
-			findings = append(findings, Finding{
-				Kind:     kind,
-				Severity: sev,
-				Message: fmt.Sprintf(
+
+			locA := Location{Path: a.wfPath, JobID: a.jobID, Line: a.line, Group: a.rawGroup}
+			locB := Location{Path: b.wfPath, JobID: b.jobID, Line: b.line, Group: b.rawGroup}
+
+			var msg string
+			if literalShared {
+				kind = KindLiteralSharedGroup
+				sev = SeverityWarning
+				msg = fmt.Sprintf(
+					"%s and %s share the literal concurrency group %q. This may be intentional "+
+						"(e.g. serializing deploys to one environment), but GitHub's docs warn: "+
+						`"By default, any existing pending job or workflow in the same concurrency `+
+						`group will be canceled and the new queued job or workflow will take its `+
+						`place." — a queued run of one can silently replace a queued run of the `+
+						`other even with cancel-in-progress: false. If this sharing is intentional, `+
+						"add a trailing \"# concurclash: shared\" comment on the group: line to "+
+						"suppress this finding",
+					locationLabel(locA), locationLabel(locB), a.rawGroup,
+				)
+			} else {
+				msg = fmt.Sprintf(
 					"%s and %s %s resolve to the same concurrency group (%q vs %q)",
 					locationLabel(locA), locationLabel(locB), verb,
 					expr.Render(a.parts), expr.Render(b.parts),
-				),
+				)
+			}
+
+			findings = append(findings, Finding{
+				Kind:      kind,
+				Severity:  sev,
+				Message:   msg,
 				Locations: []Location{locA, locB},
 			})
 			if a.cip != nil && b.cip != nil && *a.cip != *b.cip {

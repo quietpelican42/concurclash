@@ -19,7 +19,7 @@ WARNING: [possible-collision] .github/workflows/ci.yml and .github/workflows/ci2
 
 GitHub's own docs state the rule plainly:
 
-> concurrency group names must be unique across workflows to avoid canceling in-progress jobs or runs from other workflows. Otherwise, any previously in-progress or pending job will be canceled, regardless of the workflow.
+> If you have multiple workflows in the same repository, concurrency group names must be unique across workflows to avoid canceling in-progress jobs or runs from other workflows.
 > — [Using concurrency](https://docs.github.com/en/actions/using-jobs/using-concurrency)
 
 Nothing enforces that rule at authoring time. Two workflows can independently
@@ -29,6 +29,24 @@ happening to share a `name:`. `github.workflow` resolves to that `name:`
 field (or the file path, if there is none — also documented), so two
 identically named workflows produce identical `github.workflow` values, and
 a run of one cancels or blocks behind a run of the other.
+
+A second, separate hazard applies even without any of that: a plain string
+group deliberately shared between two workflows (a common pattern, e.g. one
+lock name to serialize deploys to an environment) is still subject to what
+the docs say happens inside one group, regardless of `cancel-in-progress`:
+
+> By default, any existing `pending` job or workflow in the same concurrency group will be canceled and the new queued job or workflow will take its place.
+> At most one job or workflow run can be `pending` in the concurrency group.
+> — [Using concurrency](https://docs.github.com/en/actions/using-jobs/using-concurrency)
+
+So a queued run of `deploy-api` can be silently replaced by a queued run of
+`deploy-web` if they share a group, even with `cancel-in-progress: false` on
+both. concurclash treats these two hazards differently: a collision that
+only exists because of an expression (`github.workflow`, a duplicate `name:`,
+etc.) is reported as an error, since it usually is not what the author
+intended; a collision between two groups written as plain strings is
+reported as a warning, since sharing a literal name on purpose is common —
+see `literal-shared-group` below, and how to acknowledge it.
 
 **Measured**: two workflows in one repo, both named `CI`, both using the
 docs' own recommended group pattern:
@@ -106,6 +124,27 @@ lines that GitHub renders as inline check annotations.
 concurclash -format json . | jq '.[] | select(.severity == "error")'
 ```
 
+### Suppressing an intentional collision
+
+A `literal-shared-group` finding — two workflows written with the exact same
+plain-string `concurrency.group`, no `${{ ... }}` in either — is often
+deliberate (a shared lock name to serialize deploys). Acknowledge it with a
+trailing comment on the `group:` line:
+
+```yaml
+concurrency:
+  group: production-deploy  # concurclash: shared
+  cancel-in-progress: false
+```
+
+The comment can go on either of the two colliding groups; concurclash then
+drops that pair's finding entirely (including any `cancel-in-progress`
+mismatch note for the same pair). It does not suppress `duplicate-workflow-name`,
+`definite-collision`, `possible-collision`, or `job-workflow-same-group`
+findings — those indicate the group is equal because of an expression or a
+naming accident, not a plain string someone chose on purpose, so there is
+nothing here to acknowledge away.
+
 ## Reference
 
 ### Flags
@@ -127,10 +166,11 @@ concurclash -format json . | jq '.[] | select(.severity == "error")'
 | Kind                        | Severity | Meaning |
 | ---------------------------- | -------- | ------- |
 | `duplicate-workflow-name`     | error    | Two or more workflows declare the same `name:`, and at least one uses `github.workflow` inside a concurrency group. |
-| `definite-collision`          | error    | Two groups are provably equal whenever both can run (pure literal text, or context values that are always equal within one repo). |
+| `definite-collision`          | error    | Two groups are provably equal whenever both can run, and at least one side's group contains an expression (`${{ ... }}`) — e.g. both key off `github.repository`, which is always the same value in one repo. Excludes plain-string-vs-plain-string matches; see `literal-shared-group`. |
+| `literal-shared-group`        | warning  | Two groups are provably equal, and **neither** side's group contains any expression at all — a plain string shared on purpose is common (e.g. one lock name to serialize deploys). Suppressible; see "Suppressing an intentional collision". |
 | `possible-collision`          | warning  | Two groups can be equal depending on runtime values concurclash cannot see (`inputs.*`, `matrix.*`, `github.ref`/`github.head_ref` when the two workflows' triggers may overlap). |
 | `job-workflow-same-group`     | warning  | A job's own concurrency group is textually identical to its workflow's group. GitHub does not document what this does; flagged as an undocumented risk, not a confirmed deadlock. |
-| `cancel-in-progress-mismatch` | info     | Attached to a collision finding when the two `cancel-in-progress` values differ (one run would be canceled, the other would queue). |
+| `cancel-in-progress-mismatch` | info     | Attached to a collision finding when the two `cancel-in-progress` values differ. Per GitHub's docs this doesn't just mean "one cancels, one doesn't": a *pending* run is replaced by a newer pending run in the same group regardless of either side's `cancel-in-progress` setting — only a currently *running* job's cancellation depends on it. |
 
 ## How it works
 
@@ -156,7 +196,14 @@ concurclash -format json . | jq '.[] | select(.severity == "error")'
    construction. A `github.ref`/`github.head_ref` match only counts when
    the two workflows' triggers can plausibly share ref-space (see
    Limitations).
-5. Report duplicate workflow names, job-vs-own-workflow nesting, and
+5. When a pair is provably equal, decide whether it looks accidental or
+   deliberate: if either side's *authored* group (before any substitution)
+   contains an expression, it's `definite-collision` (error); if neither
+   side has any expression at all — a plain string typed the same way in
+   two files — it's `literal-shared-group` (warning), and is dropped
+   entirely if either side carries a `# concurclash: shared` comment on its
+   `group:` line.
+6. Report duplicate workflow names, job-vs-own-workflow nesting, and
    `cancel-in-progress` mismatches on colliding pairs as separate finding
    kinds.
 
@@ -202,6 +249,17 @@ API and does not execute anything.
   "PR-ref" class as `pull_request` for simplicity, which can under- or
   over-approximate depending on the pair. Documented here rather than
   silently assumed.
+- The error/warning split between `definite-collision` and
+  `literal-shared-group` is a heuristic, not a certainty: "the authored
+  group contains an expression" is a proxy for "probably accidental," and
+  a proxy can be wrong in both directions. A group like
+  `${{ 'production-deploy' }}` (an expression that only ever evaluates to
+  one literal string) is treated as `definite-collision` even though it's
+  functionally identical to writing the string directly; conversely, two
+  independently-chosen plain strings that happen to match are still
+  `literal-shared-group` even when nobody intended to share anything. Use
+  `# concurclash: shared` to acknowledge the latter case; there is
+  currently no equivalent for suppressing a `definite-collision`.
 
 ## Compatibility
 
@@ -243,6 +301,11 @@ output at all (actionlint's only `concurrency`-related lines anywhere in
 this run were unrelated schema errors about a `queue:` key GitHub added
 after actionlint 1.7.12 shipped).
 
+Re-ran against the same 8 clones after adding the `literal-shared-group`
+downgrade: the result is unchanged (this one finding was already
+`possible-collision`, driven by `inputs.tag`, not a plain-string match), and
+none of the 193 files triggered `literal-shared-group` either.
+
 ## Development
 
 ```sh
@@ -252,7 +315,7 @@ go test -race -count=1 ./...
 gofmt -l .   # must print nothing
 ```
 
-40 test cases (including table-driven subtests) across 4 packages, all
+44 test cases (including table-driven subtests) across 4 packages, all
 passing at the time of writing.
 
 ## License
