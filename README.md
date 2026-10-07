@@ -96,7 +96,7 @@ of the three that reports this pair.
 ## Installation
 
 ```sh
-go install github.com/__GH_OWNER__/concurclash/cmd/concurclash@latest
+go install github.com/quietpelican42/concurclash/cmd/concurclash@latest
 ```
 
 Go >= 1.23. No other tools required.

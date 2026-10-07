@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/__GH_OWNER__/concurclash/internal/workflow"
+	"github.com/quietpelican42/concurclash/internal/workflow"
 )
 
 func mustParse(t *testing.T, path, yaml string) *workflow.Workflow {

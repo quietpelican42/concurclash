@@ -8,7 +8,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/__GH_OWNER__/concurclash/internal/detect"
+	"github.com/quietpelican42/concurclash/internal/detect"
 )
 
 // Format selects the output writer used by Write.

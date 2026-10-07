@@ -13,7 +13,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/__GH_OWNER__/concurclash/internal/expr"
+	"github.com/quietpelican42/concurclash/internal/expr"
 )
 
 // Concurrency is a parsed workflow- or job-level "concurrency:" block.

@@ -1,4 +1,4 @@
-module github.com/__GH_OWNER__/concurclash
+module github.com/quietpelican42/concurclash
 
 go 1.23
 

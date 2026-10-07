@@ -8,8 +8,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/__GH_OWNER__/concurclash/internal/expr"
-	"github.com/__GH_OWNER__/concurclash/internal/workflow"
+	"github.com/quietpelican42/concurclash/internal/expr"
+	"github.com/quietpelican42/concurclash/internal/workflow"
 )
 
 // Severity is how confidently and how urgently a Finding should be treated.

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/__GH_OWNER__/concurclash/internal/detect"
+	"github.com/quietpelican42/concurclash/internal/detect"
 )
 
 func sample() []detect.Finding {

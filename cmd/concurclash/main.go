@@ -12,9 +12,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/__GH_OWNER__/concurclash/internal/detect"
-	"github.com/__GH_OWNER__/concurclash/internal/report"
-	"github.com/__GH_OWNER__/concurclash/internal/workflow"
+	"github.com/quietpelican42/concurclash/internal/detect"
+	"github.com/quietpelican42/concurclash/internal/report"
+	"github.com/quietpelican42/concurclash/internal/workflow"
 )
 
 const usage = `concurclash [flags] [path]
